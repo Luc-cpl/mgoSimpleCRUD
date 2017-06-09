@@ -45,16 +45,6 @@ func (DB Database) CreateUser(userIdentity string, password string) (userID stri
 	checkByt := []byte(`{"` + DB.UserIdentityValue + `": "` + userIdentity + `"}`)
 	var checkInterface interface{}
 	err = json.Unmarshal(checkByt, &checkInterface)
-	n, err := newSession.DB(DB.Database).C("users").Find(checkInterface).Count()
-
-	if err != nil {
-		return "", err
-	}
-
-	if n != 0 {
-		err = errors.New(DB.UserIdentityValue + " already registered")
-		return "", err
-	}
 
 	salt := GenerateSalt(password)
 	hash := GenerateHash(password, salt)
@@ -68,14 +58,32 @@ func (DB Database) CreateUser(userIdentity string, password string) (userID stri
 	jsonByt := []byte(jsonMap.MakeJSON(u, ""))
 	var jsonInterface interface{}
 	json.Unmarshal(jsonByt, &jsonInterface)
+
+	n, err := newSession.DB(DB.Database).C("users").Find(checkInterface).Count()
+
+	if err != nil {
+		return "", err
+	}
+
+	if n != 0 {
+		err = errors.New(DB.UserIdentityValue + " already registered")
+		return "", err
+	}
+
 	err = newSession.DB(DB.Database).C("users").Insert(jsonInterface)
 	if err != nil {
 		return "", err
 	}
-	err = newSession.DB(DB.Database).C("users").Find(checkInterface).One(&jsonInterface)
+	for i := 0; i < 100000; i++ {
+		err = newSession.DB(DB.Database).C("users").Find(checkInterface).One(&jsonInterface)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return "", err
 	}
+
 	byt, _ := json.Marshal(jsonInterface)
 	u, _ = jsonMap.GetMap(byt, "")
 	userID = strings.Trim(u["_id"], `"`)
@@ -126,7 +134,10 @@ func (DB Database) ReadId(collection string, docID string) (doc map[string]strin
 		err := errors.New("missing docID")
 		return nil, err
 	}
-
+	if bson.IsObjectIdHex(docID) == false {
+		err = errors.New("the passed id is not a object id")
+		return nil, err
+	}
 	newSession := DB.Session.Copy()
 	defer newSession.Close()
 
@@ -179,8 +190,14 @@ func (DB Database) CreateInside(collection string, originalMap map[string]string
 		err = errors.New("check your json file")
 		return err
 	}
-	err = newSession.DB(DB.Database).C(collection).Update(jsonOld, jsonNew)
+	for i := 0; i < 100000; i++ {
+		err = newSession.DB(DB.Database).C(collection).Update(jsonOld, jsonNew)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
+		err = errors.New("failed on document update")
 		return err
 	}
 
@@ -223,8 +240,14 @@ func (DB Database) UpdateValue(collection string, oldMap map[string]string, new 
 		return err
 	}
 
-	err = newSession.DB(DB.Database).C(collection).Update(jsonOld, jsonNew)
+	for i := 0; i < 100000; i++ {
+		err = newSession.DB(DB.Database).C(collection).Update(jsonOld, jsonNew)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
+		err = errors.New("failed on document update")
 		return err
 	}
 
@@ -232,29 +255,27 @@ func (DB Database) UpdateValue(collection string, oldMap map[string]string, new 
 }
 
 //DeleteInside deletes a value inside a document on database
-func (DB Database) DeleteInside(collection string, docID string, deleteMap map[string]string) error {
+func (DB Database) DeleteInside(collection string, originalMap map[string]string, deleteMap map[string]string) error {
 	if collection == "" {
 		err := errors.New("missing collection")
 		return err
 	}
-	if docID == "" {
-		err := errors.New("missing docID")
+	if originalMap == nil {
+		err := errors.New("missing oldDoc")
+		return err
+	}
+	originalMap["_id"] = `ObjectId(` + originalMap["_id"] + `)`
+	o := []byte(jsonMap.MakeJSON(originalMap, ""))
+	var jsonOld interface{}
+	err := bson.UnmarshalJSON(o, &jsonOld)
+	if err != nil {
+		err = errors.New("check your original json file")
 		return err
 	}
 	newSession := DB.Session.Copy()
 	defer newSession.Close()
-
-	var jsonFind interface{}
-	err := newSession.DB(DB.Database).C(collection).FindId(bson.ObjectIdHex(docID)).One(&jsonFind)
-	if err != nil {
-		return err
-	}
-
-	byt, _ := json.Marshal(jsonFind)
-	u, _ := jsonMap.GetMap(byt, "")
-	newMap, err := jsonMap.Delete(u, deleteMap)
-	jsonMap.Delete(u, deleteMap)
-	newMap["_id"] = `ObjectId(` + u["_id"] + `)`
+	newMap, err := jsonMap.Delete(originalMap, deleteMap)
+	newMap["_id"] = originalMap["_id"]
 	if err != nil {
 		return err
 	}
@@ -262,13 +283,20 @@ func (DB Database) DeleteInside(collection string, docID string, deleteMap map[s
 	s := jsonMap.MakeJSON(newMap, "")
 
 	var jsonNew interface{}
-	err = bson.Unmarshal([]byte(s), &jsonNew)
+	err = bson.UnmarshalJSON([]byte(s), &jsonNew)
 	if err != nil {
 		err = errors.New("check your json file")
 		return err
 	}
-	err = newSession.DB(DB.Database).C(collection).Update(jsonFind, jsonNew)
+
+	for i := 0; i < 100000; i++ {
+		err = newSession.DB(DB.Database).C(collection).Update(jsonOld, jsonNew)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
+		err = errors.New("failed on document update")
 		return err
 	}
 
@@ -305,14 +333,15 @@ func (DB Database) Find(collection string, request map[string]string) (doc []map
 	}
 	newSession := DB.Session.Copy()
 	defer newSession.Close()
-
-	s := jsonMap.MakeJSON(request, "")
 	var jsonNew interface{}
-	if s != "" {
-		err = json.Unmarshal([]byte(s), &jsonNew)
-		if err != nil {
-			err = errors.New("check your json map")
-			return nil, err
+	if len(request) != 1 {
+		s := jsonMap.MakeJSON(request, "")
+		if s != "" {
+			err = json.Unmarshal([]byte(s), &jsonNew)
+			if err != nil {
+				err = errors.New("check your json map")
+				return nil, err
+			}
 		}
 	}
 
@@ -339,12 +368,16 @@ func (DB Database) FindOne(collection string, request map[string]string) (doc ma
 	newSession := DB.Session.Copy()
 	defer newSession.Close()
 
-	s := jsonMap.MakeJSON(request, "")
 	var jsonNew interface{}
-	err = json.Unmarshal([]byte(s), &jsonNew)
-	if err != nil {
-		err = errors.New("check your json map")
-		return nil, err
+	if len(request) != 1 {
+		s := jsonMap.MakeJSON(request, "")
+		if s != "" {
+			err = json.Unmarshal([]byte(s), &jsonNew)
+			if err != nil {
+				err = errors.New("check your json map")
+				return nil, err
+			}
+		}
 	}
 
 	var jsonFind interface{}
@@ -388,61 +421,13 @@ func (DB Database) DeleteDoc(collection string, docID string) error {
 //{"method": " the method to use ","collection": " the collection name ","values":{ the values to read, insert, update or delete }, "request":{ the request to find } "id":"the id of the object to find"}
 func CRUDRequest(user User, request Request, authMapFile string) (response []byte, err error) {
 	bytValues, _ := json.Marshal(request.Values)
-	mapValues, err := jsonMap.GetMap(bytValues, "")
-	if err != nil {
-		return nil, err
-	}
 	bytRequest, _ := json.Marshal(request.Request)
 	mapRequest, err := jsonMap.GetMap(bytRequest, "")
 	if err != nil {
 		return nil, err
 	}
 
-	var crudMehod string
-	//define methods
-	switch request.Method {
-	case "update":
-		delete(mapValues, "")
-		crudMehod = "update"
-	case "find":
-		crudMehod = "read"
-	case "findOne":
-		crudMehod = "read"
-	case "readID":
-		crudMehod = "read"
-	case "createDoc":
-		crudMehod = "create"
-	case "create":
-		delete(mapValues, "")
-		crudMehod = "create"
-	case "deleteDoc":
-		crudMehod = "delete"
-	case "delete":
-		delete(mapValues, "")
-		crudMehod = "delete"
-	default:
-		err = errors.New("wrong method")
-		return nil, err
-	}
-
-	authMap, err := loadAuthMap(authMapFile)
-	if err != nil {
-		return nil, err
-	}
-	auths, err := authRequest(user, request.Collection, mapValues, authMap)
-	if err != nil {
-		return nil, err
-	}
-	auth := false
-	for n := range mapValues {
-		if _, exist := auths[n]; exist == false {
-			sa := strings.Split(n, " ")
-			err = errors.New(sa[len(sa)-1] + "_auth dont find on authMap file")
-			return nil, err
-		}
-	}
 	u := make([]map[string]string, 1)
-	method := request.Method
 	bl := false
 	if request.Method != "createDoc" {
 		if request.ID != "" {
@@ -455,15 +440,78 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 			if err != nil {
 				return nil, err
 			}
-		} else if request.Method == "findAll" {
+		} else {
 			u, err = DB.Find(request.Collection, mapRequest)
 			if err != nil {
 				return nil, err
 			}
 		}
-		r := make([]map[string]string, len(u))
-		v := make(map[string]string)
-		for t := range u {
+	}
+
+	mapValueArr := make([]map[string]string, len(u))
+	var crudMethod string
+	for z := range u {
+		mapValues, err := jsonMap.GetMap(bytValues, "")
+		if err != nil {
+			return nil, err
+		}
+		//define methods
+		switch request.Method {
+		case "update":
+			delete(mapValues, "")
+			crudMethod = "update"
+		case "find":
+			crudMethod = "read"
+		case "findOne":
+			crudMethod = "read"
+		case "readID":
+			crudMethod = "read"
+		case "createDoc":
+			crudMethod = "create"
+		case "create":
+			delete(mapValues, "")
+			crudMethod = "create"
+		case "deleteDoc":
+			mapValues[""] = ""
+			crudMethod = "delete"
+		case "delete":
+			delete(mapValues, "")
+			crudMethod = "delete"
+		default:
+			err = errors.New("wrong method")
+			return nil, err
+		}
+
+		arr := makeArr(u[z], mapValues)
+		mapValueArr[z] = arr
+	}
+
+	authMap, err := loadAuthMap(authMapFile)
+	if err != nil {
+		return nil, err
+	}
+
+	r := make([]map[string]string, len(u))
+	z := 0
+	for y := 0; y < len(mapValueArr); y++ {
+		auths := make(map[string]string)
+		auths, err = authRequest(user, request.Collection, mapValueArr[y], authMap)
+		if err != nil {
+			return nil, err
+		}
+
+		for n := range mapValueArr[y] {
+			if _, exist := auths[n]; exist == false {
+				sa := strings.Split(n, " ")
+				err = errors.New(sa[len(sa)-1] + "_auth dont find on authMap file")
+				return nil, err
+			}
+		}
+
+		if request.Method != "createDoc" {
+			v := make(map[string]string)
+			auth := false
+			var errU error
 			for n := range auths {
 				array := strings.Split(auths[n], " ")
 				gAuth := false
@@ -477,17 +525,29 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 					el = strings.Trim(el, `"`)
 					//find the auths needed
 					switch el {
-					case "g-" + crudMehod:
+					case "g-" + crudMethod:
 						gAuth = true
-					case "a-" + crudMehod:
+					case "a-" + crudMethod:
 						aAuth = true
-					case "u-" + crudMehod:
+					case "u-" + crudMethod:
 						uAuth = true
-					case "c-" + crudMehod:
+					case "c-" + crudMethod:
 						cAuth = true
-					case "sc-" + crudMehod:
+					case "sc-" + crudMethod:
 						scAuth = true
-					case "adm-" + crudMehod:
+					case "adm-" + crudMethod:
+						admAuth = true
+					case "g-all":
+						gAuth = true
+					case "a-all":
+						aAuth = true
+					case "u-all":
+						uAuth = true
+					case "c-all":
+						cAuth = true
+					case "sc-all":
+						scAuth = true
+					case "adm-all":
 						admAuth = true
 					case "blacklist":
 						blacklist = true
@@ -495,141 +555,155 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 				}
 				//check if user have the auths and fuels a map for read method
 				if gAuth {
-					if val, exist := u[t][n]; exist {
+					if val, exist := u[y][n]; exist {
 						v[n] = val
 					}
 					auth = true
 				} else if user.ID != "" && aAuth {
-					if val, exist := u[t][n]; exist {
+					if val, exist := u[y][n]; exist {
 						v[n] = val
 					}
 					auth = true
-				} else if u[t]["_id"] == `"`+user.ID+`"` && uAuth {
-					if val, exist := u[t][n]; exist {
+				} else if u[y]["_id"] == `"`+user.ID+`"` && uAuth {
+					if val, exist := u[y][n]; exist {
 						v[n] = val
 					}
 					auth = true
-				} else if _, exist := u[t]["contacts "+user.ID]; exist && cAuth {
-					if val, exist := u[t][n]; exist {
+				} else if _, exist := u[y]["contacts "+user.ID]; exist && cAuth {
+					if val, exist := u[y][n]; exist {
 						v[n] = val
 					}
 					auth = true
-				} else if _, exist := mapValues["contacts "+user.ID]; exist && scAuth {
-					if mapValues["contacts"] == "json:object "+user.ID {
-						if val, exist := u[t][n]; exist {
+				} else if _, exist := mapValueArr[y]["contacts "+user.ID]; exist && scAuth {
+					if mapValueArr[y]["contacts"] == "json:object "+user.ID {
+						if val, exist := u[y][n]; exist {
 							v[n] = val
 						}
 						auth = true
+					} else {
+						auth = false
+						if crudMethod != "read" {
+							break
+						}
 					}
 				} else if user.Admin && admAuth {
-					if val, exist := u[t][n]; exist {
+					if val, exist := u[y][n]; exist {
 						v[n] = val
 					}
 					auth = true
-				} else if _, exist := u[t]["blacklist "+user.ID]; exist && blacklist {
+				} else if _, exist := u[y]["blacklist "+user.ID]; exist && blacklist {
 					auth = false
 					bl = true
-					if crudMehod != "read" {
+					delete(v, n)
+					if crudMethod != "read" {
 						break
 					}
 				} else {
 					auth = false
-					if crudMehod != "read" {
+					if crudMethod != "read" {
 						break
 					}
 				}
 			}
-			r[t] = v
+			if auth {
+				switch crudMethod {
+				case "create":
+					errU = DB.CreateInside(request.Collection, u[y], mapValueArr[y])
+					if errU != nil {
+						return nil, err
+					}
+				case "delete":
+					switch request.Method {
+					case "delete":
+						errU = DB.DeleteInside(request.Collection, u[y], mapValueArr[y])
+					case "deleteDoc":
+						errU = DB.DeleteDoc(request.Collection, strings.Trim(u[y]["_id"], `"`))
+					}
+				case "update":
+					errU = DB.UpdateValue(request.Collection, u[y], mapValueArr[y])
+				}
+				if bl && crudMethod != "read" {
+					z++
+				}
+				if errU == nil {
+					z++
+				}
+			}
+			if crudMethod == "read" {
+				r[y] = v
+			}
+
+		} else if request.Method == "createDoc" && y == 1 {
+			//auths check for create Doc
+			auth := false
+			array := strings.Split(auths[""], " ")
+			gAuth := false
+			aAuth := false
+			admAuth := false
+			for _, el := range array {
+				el = strings.Trim(el, `"`)
+				switch el {
+				case "g-" + crudMethod:
+					gAuth = true
+				case "a-" + crudMethod:
+					aAuth = true
+				case "adm-" + crudMethod:
+					admAuth = true
+				case "g-all":
+					gAuth = true
+				case "a-all":
+					aAuth = true
+				case "adm-all":
+					admAuth = true
+				}
+			}
+			if gAuth {
+				auth = true
+			} else if user.ID != "" && aAuth {
+				auth = true
+			} else if user.Admin && admAuth {
+				auth = true
+			} else {
+				auth = false
+			}
+			if auth {
+				err = DB.CreateDoc(request.Collection, mapValueArr[y])
+				if err != nil {
+					response = []byte(`{"` + crudMethod + `": 0 }`)
+				} else {
+					response = []byte(`{"` + crudMethod + `": 1 }`)
+				}
+			}
+
 		}
-		response = joinTo(mapValues, r)
+	}
+
+	if crudMethod == "read" {
+		response = joinTo(mapValueArr, r)
 	} else {
-		//auths check for create Doc
-		array := strings.Split(auths[""], " ")
-		gAuth := false
-		aAuth := false
-		admAuth := false
-		for _, el := range array {
-			el = strings.Trim(el, `"`)
-			switch el {
-			case "g-" + crudMehod:
-				gAuth = true
-			case "a-" + crudMehod:
-				aAuth = true
-			case "adm-" + crudMehod:
-				admAuth = true
-			}
-		}
-		if gAuth {
-			auth = true
-		} else if user.ID != "" && aAuth {
-			auth = true
-		} else if user.Admin && admAuth {
-			auth = true
-		} else {
-			auth = false
-		}
+		response = []byte(`{"` + crudMethod + `": ` + strconv.Itoa(z) + ` }`)
 	}
-	//execute the methods (create | update | delete)
-	if auth {
-		switch method {
-		case "update":
-			for n := range u {
-				err = DB.UpdateValue(request.Collection, u[n], mapValues)
-				if err != nil {
-					break
-				}
-			}
-			return nil, err
-		case "createDoc":
-			err = DB.CreateDoc(request.Collection, mapValues)
-			if err != nil {
-				break
-			}
-			return nil, err
-		case "create":
-			for n := range u {
-				err = DB.CreateInside(request.Collection, u[n], mapValues)
-				if err != nil {
-					break
-				}
-			}
-			return nil, err
-		case "deleteDoc":
-			for n := range u {
-				err = DB.DeleteDoc(request.Collection, strings.Trim(u[n]["_id"], `"`))
-				if err != nil {
-					break
-				}
-			}
-			return nil, err
-		case "delete":
-			for n := range u {
-				err = DB.DeleteInside(request.Collection, strings.Trim(u[n]["_id"], `"`), mapValues)
-				if err != nil {
-					break
-				}
-			}
-			return nil, err
-		}
-	} else if crudMehod != "read" && bl == false {
-		err = errors.New("permission denied")
-	}
+
 	//send the response file for read method and if exists, an error
 	return response, err
 }
 
-func joinTo(original map[string]string, new []map[string]string) []byte {
+func joinTo(original []map[string]string, new []map[string]string) []byte {
 	arr := make([]map[string]string, len(new))
+
 	for key, el := range new {
 		newM := make(map[string]string)
-		for n := range original {
-			if _, exist := el[n]; exist == false {
-				newM[n] = original[n]
+		for n := range original[key] {
+			if val, exist := el[n]; exist {
+				newM[n] = val
 			} else {
-				newM[n] = el[n]
+				newM[n] = original[key][n]
 			}
 		}
-		arr[key] = newM
+
+		if newM != nil {
+			arr[key] = newM
+		}
 	}
 	newS := "["
 	for i := 0; i < len(arr); i++ {
@@ -661,21 +735,26 @@ func authRequest(user User, collection string, createMap map[string]string, auth
 	response := make(map[string]string)
 	auth := false
 	for keyO := range createMap {
-		key := strings.Replace(keyO, user.ID, "&user_id", -1)
+		key := strings.Replace(keyO, user.ID, "&obj_id", -1)
 		keyArr := strings.Split(key, " ")
 		for k := range keyArr {
 			_, err := strconv.Atoi(keyArr[k])
-			if err == nil {
-				keyArr[k] = "0"
-			} else if keyArr[k] == "&new" {
-				keyArr[k] = "0"
+			if err != nil && strings.Contains(keyArr[k], "&new") == false {
+				if k == 0 {
+					key = keyArr[k]
+				} else if bson.IsObjectIdHex(keyArr[k]) {
+					key += " &obj_id"
+				} else if strings.Contains(keyArr[k], "&arr:") == false {
+					key += " " + keyArr[k]
+				}
+			} else if k != len(keyArr)-1 {
+				key += " 0"
 			}
 		}
-		key = strings.Join(keyArr, " ")
+		if key != "" {
+			key = " " + key
+		}
 		for n := range arr {
-			if key != "" && n == 0 {
-				key = " " + key
-			}
 			if val, exist := authMap[arr[n]+" "+collection+key+"_auth"]; exist {
 				response[keyO] = val
 				auth = true
@@ -712,4 +791,66 @@ func GenerateHash(password string, salt string) string {
 	hashString := hex.EncodeToString(hash.Sum(nil))
 
 	return hashString
+}
+
+func makeArr(original map[string]string, new map[string]string) map[string]string {
+	new2 := make(map[string]string)
+	del := make(map[string]string)
+	new2 = new
+	finished := false
+	for finished == false {
+		finished = true
+		for n := range new2 {
+			if strings.HasPrefix(new2[n], "json:object &arr:") {
+				finished = false
+				arr := strings.Split(new2[n], " ")
+				sArr := strings.Split(strings.TrimLeft(new2[n], "json:object &arr:"), "-")
+				t := strings.TrimRight(n, " "+arr[1])
+				tArr := strings.Split(original[t], " ")
+				n1, _ := strconv.Atoi(tArr[len(tArr)-1])
+				n1++
+				n0, err := strconv.Atoi(sArr[0])
+				if err == nil {
+					if len(sArr) == 2 {
+						nt, err := strconv.Atoi(sArr[1])
+						if err == nil && nt < n1 {
+							n1 = nt
+						}
+					}
+				} else {
+					n0 = 1
+				}
+				new2[n] = "json:array"
+				for i := n0 - 1; i < n1; i++ {
+					new2[n] += " " + strconv.Itoa(i)
+					for k := range new2 {
+						if strings.HasPrefix(k, n+" "+arr[1]) {
+							nK := strings.TrimSpace(n + " " + strconv.Itoa(i) + " " + strings.TrimLeft(k, n+" "+arr[1]))
+							new2[nK] = new2[k]
+							del[k] = ""
+						}
+					}
+				}
+				if n0 > n1 {
+					new2[n] += " "
+					for k := range new2 {
+						if strings.HasPrefix(k, n+" "+arr[1]) {
+							//sp := strings.Split(n, " ")
+							//dl := sp[len(sp)-1]
+							//dkey := strings.TrimRight(n, " "+dl)
+							//dMap := make(map[string]string)
+							//dMap[dkey] = dl
+							//new2, _ = jsonMap.Delete(new2, dMap)
+							del[k] = ""
+						}
+					}
+				}
+			}
+		}
+	}
+	for n := range del {
+		delete(new2, n)
+	}
+
+	return new2
 }
