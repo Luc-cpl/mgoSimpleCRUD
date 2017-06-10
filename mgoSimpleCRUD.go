@@ -493,6 +493,7 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 
 	r := make([]map[string]string, len(u))
 	z := 0
+
 	for y := 0; y < len(mapValueArr); y++ {
 		auths := make(map[string]string)
 		auths, err = authRequest(user, request.Collection, mapValueArr[y], authMap)
@@ -633,7 +634,7 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 				r[y] = v
 			}
 
-		} else if request.Method == "createDoc" && y == 1 {
+		} else if request.Method == "createDoc" {
 			//auths check for create Doc
 			auth := false
 			array := strings.Split(auths[""], " ")
@@ -671,7 +672,7 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 				if err != nil {
 					response = []byte(`{"` + crudMethod + `": 0 }`)
 				} else {
-					response = []byte(`{"` + crudMethod + `": 1 }`)
+					z++
 				}
 			}
 
