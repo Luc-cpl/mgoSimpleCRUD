@@ -12,6 +12,8 @@ import (
 
 	"errors"
 
+	"reflect"
+
 	"github.com/Luc-cpl/jsonMap"
 	mgo "gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
@@ -33,6 +35,7 @@ type Database struct {
 	Session           *mgo.Session
 	Database          string
 	UserIdentityValue string
+	AuthMap           map[string]string
 }
 
 var DB Database
@@ -46,6 +49,17 @@ func (DB Database) CreateUser(userIdentity string, password string) (userID stri
 	var checkInterface interface{}
 	err = json.Unmarshal(checkByt, &checkInterface)
 
+	n, err := newSession.DB(DB.Database).C("users").Find(checkInterface).Count()
+
+	if err != nil {
+		return "", err
+	}
+
+	if n != 0 {
+		err = errors.New(DB.UserIdentityValue + " already registered")
+		return "", err
+	}
+
 	salt := GenerateSalt(password)
 	hash := GenerateHash(password, salt)
 
@@ -58,17 +72,6 @@ func (DB Database) CreateUser(userIdentity string, password string) (userID stri
 	jsonByt := []byte(jsonMap.MakeJSON(u, ""))
 	var jsonInterface interface{}
 	json.Unmarshal(jsonByt, &jsonInterface)
-
-	n, err := newSession.DB(DB.Database).C("users").Find(checkInterface).Count()
-
-	if err != nil {
-		return "", err
-	}
-
-	if n != 0 {
-		err = errors.New(DB.UserIdentityValue + " already registered")
-		return "", err
-	}
 
 	err = newSession.DB(DB.Database).C("users").Insert(jsonInterface)
 	if err != nil {
@@ -92,7 +95,7 @@ func (DB Database) CreateUser(userIdentity string, password string) (userID stri
 }
 
 //LoginUser checks the parameters passed and the "users" collection and response whith an ID if the userIdentity and password is whright
-func (DB Database) LoginUser(userIdentity string, password string) (userID string, err error) {
+func (DB Database) LoginUser(userIdentity string, password string) (user User, err error) {
 	newSession := DB.Session.Copy()
 	defer newSession.Close()
 
@@ -104,7 +107,7 @@ func (DB Database) LoginUser(userIdentity string, password string) (userID strin
 	err = newSession.DB(DB.Database).C("users").Find(checkInterface).One(&jsonInterface)
 
 	if err != nil {
-		return "", err
+		return user, err
 	}
 
 	byt, _ := json.Marshal(jsonInterface)
@@ -116,12 +119,15 @@ func (DB Database) LoginUser(userIdentity string, password string) (userID strin
 
 	if hash != serverHash {
 		err = errors.New("wrong password")
-		return "", err
+		return user, err
 	}
 
-	userID = strings.Trim(u["_id"], `"`)
+	user.ID = strings.Trim(u["_id"], `"`)
+	if strings.EqualFold(u["admin"], `"true"`) {
+		user.Admin = true
+	}
 
-	return userID, nil
+	return user, nil
 }
 
 //ReadId reads an ID pased in an collection on database
@@ -419,13 +425,9 @@ func (DB Database) DeleteDoc(collection string, docID string) error {
 //Methods : "update" "find" "findOne" "readID" "createDoc" "create" "deleteDoc" "delete"
 //the request json model:
 //{"method": " the method to use ","collection": " the collection name ","values":{ the values to read, insert, update or delete }, "request":{ the request to find } "id":"the id of the object to find"}
-func CRUDRequest(user User, request Request, authMapFile string) (response []byte, err error) {
-	bytValues, _ := json.Marshal(request.Values)
-	bytRequest, _ := json.Marshal(request.Request)
-	mapRequest, err := jsonMap.GetMap(bytRequest, "")
-	if err != nil {
-		return nil, err
-	}
+func (DB Database) CRUDRequest(user User, request Request) (response []byte, err error) {
+
+	request, _, mapRequest := organiseRequest(request, user)
 
 	u := make([]map[string]string, 1)
 	bl := false
@@ -451,7 +453,7 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 	mapValueArr := make([]map[string]string, len(u))
 	var crudMethod string
 	for z := range u {
-		mapValues, err := jsonMap.GetMap(bytValues, "")
+		_, mapValues, _ := organiseRequest(request, user)
 		if err != nil {
 			return nil, err
 		}
@@ -482,24 +484,14 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 			return nil, err
 		}
 
-		arr := makeArr(u[z], mapValues)
-		mapValueArr[z] = arr
-	}
-
-	authMap, err := loadAuthMap(authMapFile)
-	if err != nil {
-		return nil, err
+		mapValueArr[z] = makeArrays(u[z], mapValues)
 	}
 
 	r := make([]map[string]string, len(u))
 	z := 0
-
 	for y := 0; y < len(mapValueArr); y++ {
 		auths := make(map[string]string)
-		auths, err = authRequest(user, request.Collection, mapValueArr[y], authMap)
-		if err != nil {
-			return nil, err
-		}
+		auths = authRequest(user, request.Collection, mapValueArr[y], DB.AuthMap)
 
 		for n := range mapValueArr[y] {
 			if _, exist := auths[n]; exist == false {
@@ -554,6 +546,7 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 						blacklist = true
 					}
 				}
+
 				//check if user have the auths and fuels a map for read method
 				if gAuth {
 					if val, exist := u[y][n]; exist {
@@ -684,7 +677,6 @@ func CRUDRequest(user User, request Request, authMapFile string) (response []byt
 	} else {
 		response = []byte(`{"` + crudMethod + `": ` + strconv.Itoa(z) + ` }`)
 	}
-
 	//send the response file for read method and if exists, an error
 	return response, err
 }
@@ -722,21 +714,38 @@ func joinTo(original []map[string]string, new []map[string]string) []byte {
 	return response
 }
 
-func loadAuthMap(path string) (authMap map[string]string, err error) {
+func LoadAuthMap(path string, hotReload bool) (authMap map[string]string, err error) {
 	file, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
+	if hotReload {
+		go func(path string) {
+			var old []byte
+			for {
+				new, _ := ioutil.ReadFile(path)
+				if !reflect.DeepEqual(new, old) {
+					DB.AuthMap, _ = jsonMap.GetMap(new, "")
+					old = new
+				}
+			}
+		}(path)
+	}
+
 	return jsonMap.GetMap(file, "")
 }
 
-func authRequest(user User, collection string, createMap map[string]string, authMap map[string]string) (auths map[string]string, err error) {
+func authRequest(user User, collection string, createMap map[string]string, authMap map[string]string) (auths map[string]string) {
 	arr := strings.Split(strings.TrimLeft(authMap[""], "json:array "), " ")
 	response := make(map[string]string)
-	auth := false
+
 	for keyO := range createMap {
-		key := strings.Replace(keyO, user.ID, "&obj_id", -1)
+		key := keyO
+		if !strings.EqualFold(user.ID, "") {
+			key = strings.Replace(key, user.ID, "&obj_id", -1)
+		}
+
 		keyArr := strings.Split(key, " ")
 		for k := range keyArr {
 			_, err := strconv.Atoi(keyArr[k])
@@ -758,24 +767,20 @@ func authRequest(user User, collection string, createMap map[string]string, auth
 		for n := range arr {
 			if val, exist := authMap[arr[n]+" "+collection+key+"_auth"]; exist {
 				response[keyO] = val
-				auth = true
 			} else if val, exist := authMap[arr[n]+" "+collection+key]; exist {
-				trim := strings.TrimLeft(val, "json:object ")
-				trim = strings.TrimLeft(trim, "json:array ")
-				if trim == val {
+				if !strings.HasPrefix(val, "json:") {
 					response[keyO] = val
-					auth = true
+				} else {
+					response[keyO] = `""`
 				}
 			}
 		}
 	}
-	if auth == false {
-		err = errors.New("auth flag not find")
-		return nil, err
-	}
-	return response, err
+
+	return response
 }
 
+//GenerateSalt generates a password salt
 func GenerateSalt(password string) string {
 	var letters = []rune("abcdefghijklmn" + password + "opqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890123456789" + password)
 	b := make([]rune, 20)
@@ -785,6 +790,7 @@ func GenerateSalt(password string) string {
 	return string(b)
 }
 
+//GenerateHash generates a hash for the password and passed salt
 func GenerateHash(password string, salt string) string {
 	s := password + salt
 	hash := crypto.SHA1.New()
@@ -794,7 +800,31 @@ func GenerateHash(password string, salt string) string {
 	return hashString
 }
 
-func makeArr(original map[string]string, new map[string]string) map[string]string {
+func organiseRequest(original Request, user User) (new Request, mapValues map[string]string, mapRequest map[string]string) {
+	bytVal, _ := json.Marshal(original.Values)
+	mapValues, _ = jsonMap.GetMap(bytVal, "")
+
+	for n := range mapValues {
+		if strings.EqualFold(mapValues[n], `"&user_id"`) {
+			mapValues[n] = `"` + user.ID + `"`
+		}
+	}
+
+	bytReq, _ := json.Marshal(original.Request)
+	mapRequest, _ = jsonMap.GetMap(bytReq, "")
+	for n := range mapValues {
+		if strings.EqualFold(mapRequest[n], `"&user_id"`) {
+			mapRequest[n] = `"` + user.ID + `"`
+		}
+	}
+	if strings.EqualFold(original.ID, "&user_id") {
+		original.ID = user.ID
+	}
+
+	return original, mapValues, mapRequest
+}
+
+func makeArrays(original map[string]string, new map[string]string) map[string]string {
 	new2 := make(map[string]string)
 	del := make(map[string]string)
 	new2 = new
@@ -836,12 +866,6 @@ func makeArr(original map[string]string, new map[string]string) map[string]strin
 					new2[n] += " "
 					for k := range new2 {
 						if strings.HasPrefix(k, n+" "+arr[1]) {
-							//sp := strings.Split(n, " ")
-							//dl := sp[len(sp)-1]
-							//dkey := strings.TrimRight(n, " "+dl)
-							//dMap := make(map[string]string)
-							//dMap[dkey] = dl
-							//new2, _ = jsonMap.Delete(new2, dMap)
 							del[k] = ""
 						}
 					}
