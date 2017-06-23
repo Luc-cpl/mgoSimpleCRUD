@@ -600,6 +600,11 @@ func (DB Database) CRUDRequest(user User, request Request) (response []byte, err
 				}
 			}
 			if auth {
+				for key := range u[y] {
+					if strings.HasPrefix(u[y][key], `"`) {
+						u[y][key] = `"` + strings.Replace(strings.Trim(u[y][key], `"`), `"`, `\"`, -1) + `"`
+					}
+				}
 				switch crudMethod {
 				case "create":
 					errU = DB.CreateInside(request.Collection, u[y], mapValueArr[y])
@@ -616,12 +621,11 @@ func (DB Database) CRUDRequest(user User, request Request) (response []byte, err
 				case "update":
 					errU = DB.UpdateValue(request.Collection, u[y], mapValueArr[y])
 				}
-				if bl && crudMethod != "read" {
-					z++
-				}
 				if errU == nil {
 					z++
 				}
+			} else if bl && crudMethod != "read" {
+				z++
 			}
 			if crudMethod == "read" {
 				r[y] = v
@@ -688,6 +692,9 @@ func joinTo(original []map[string]string, new []map[string]string) []byte {
 		newM := make(map[string]string)
 		for n := range original[key] {
 			if val, exist := el[n]; exist {
+				if strings.Contains(strings.Trim(val, `"`), `"`) {
+					val = `"` + strings.Replace(strings.Trim(val, `"`), `"`, `\"`, -1) + `"`
+				}
 				newM[n] = val
 			} else {
 				newM[n] = original[key][n]
